@@ -157,141 +157,321 @@ def accumulated_bet(conn, t):
 
     return float(row["total"] or 0), int(row["n"] or 0)
 def cmd_poll(args):
-    """Monitora acumulado de BUY e detecta SELL depois de grande acumulacao."""
+    """Monitora BUY acumulado e reducao de posicao da mesma carteira."""
     conn = DB.connect(args.db)
 
     # Aproximadamente R$ 990 mil
     ACCUMULATED_MIN_USD = 190_000
 
+    # ---------------------------------------------------------
+    # Busca trades recentes
+    # ---------------------------------------------------------
     trades = fetch_trades(limit=args.lookback)
 
-    # Salva os trades no banco
+    # Guarda somente trades que realmente entraram no banco agora.
+    # Isso evita tratar SELL antigo como uma nova retirada.
+    new_trades = []
+
     for t in trades:
-        DB.insert_trade(conn, t, usd(t))
+        tx_key = (
+            f"{t.get('transactionHash', '')}:"
+            f"{t.get('asset', '')}:"
+            f"{t.get('timestamp', '')}"
+        )
+
+        exists = conn.execute(
+            "SELECT 1 FROM trades WHERE tx_key=?",
+            (tx_key,),
+        ).fetchone()
+
+        if not exists:
+            DB.insert_trade(conn, t, usd(t))
+            new_trades.append(t)
 
     conn.commit()
 
     new_alerts = 0
 
-    # Processa em ordem cronologica
-    for t in sorted(trades, key=lambda x: x.get("timestamp", 0)):
+    # =========================================================
+    # 1) HISTORICO COMPLETO
+    #
+    # Agrupa:
+    # mesma carteira + mesmo mercado + mesma selecao
+    # =========================================================
+    groups = conn.execute(
+        """
+        SELECT
+            wallet,
+            condition_id,
+            outcome,
+            COALESCE(
+                SUM(CASE WHEN side='BUY' THEN usd ELSE 0 END), 0
+            ) AS buy_total,
+            COALESCE(
+                SUM(CASE WHEN side='SELL' THEN usd ELSE 0 END), 0
+            ) AS sell_total,
+            COUNT(
+                CASE WHEN side='BUY' THEN 1 END
+            ) AS buy_count
+        FROM trades
+        WHERE wallet IS NOT NULL
+          AND wallet != ''
+          AND condition_id IS NOT NULL
+          AND condition_id != ''
+          AND outcome IS NOT NULL
+          AND outcome != ''
+        GROUP BY wallet, condition_id, outcome
+        HAVING buy_total >= ?
+        """,
+        (ACCUMULATED_MIN_USD,),
+    ).fetchall()
 
-        wallet = (t.get("proxyWallet") or t.get("wallet") or "").lower()
-        condition_id = t.get("conditionId") or ""
-        outcome = t.get("outcome") or ""
-        side = (t.get("side") or "").upper()
+    # =========================================================
+    # 2) ALERTA DE BUY ACUMULADO
+    # =========================================================
+    for g in groups:
 
-        if not wallet or not condition_id or not outcome:
+        wallet = g["wallet"]
+        condition_id = g["condition_id"]
+        outcome = g["outcome"]
+
+        buy_total = float(g["buy_total"] or 0)
+        sell_total = float(g["sell_total"] or 0)
+        buy_count = int(g["buy_count"] or 0)
+
+        alert_key = (
+            f"accumulated:{wallet}:"
+            f"{condition_id}:{outcome}"
+        )
+
+        # Ja avisou anteriormente.
+        if DB.already_alerted(conn, alert_key):
             continue
 
-        # =====================================================
-        # 1) ACUMULADO DE BUY
-        # Mesmo jogador + mesmo mercado + mesma selecao
-        # =====================================================
-        row = conn.execute(
+        # Descobre exatamente quando cruzou US$ 190 mil.
+        buy_rows = conn.execute(
             """
-            SELECT COALESCE(SUM(usd), 0) AS total
+            SELECT ts, usd
             FROM trades
-            WHERE wallet = ?
-              AND condition_id = ?
-              AND outcome = ?
-              AND side = 'BUY'
+            WHERE wallet=?
+              AND condition_id=?
+              AND outcome=?
+              AND side='BUY'
+            ORDER BY ts ASC
+            """,
+            (wallet, condition_id, outcome),
+        ).fetchall()
+
+        running_buy = 0.0
+        threshold_ts = None
+
+        for b in buy_rows:
+            running_buy += float(b["usd"] or 0)
+
+            if running_buy >= ACCUMULATED_MIN_USD:
+                threshold_ts = int(b["ts"])
+                break
+
+        if threshold_ts is None:
+            continue
+
+        latest = conn.execute(
+            """
+            SELECT title
+            FROM trades
+            WHERE wallet=?
+              AND condition_id=?
+              AND outcome=?
+            ORDER BY ts DESC
+            LIMIT 1
             """,
             (wallet, condition_id, outcome),
         ).fetchone()
 
-        accumulated = float(row["total"] or 0)
+        title = (
+            latest["title"]
+            if latest and latest["title"]
+            else "Mercado Polymarket"
+        )
 
-        # =====================================================
-        # 2) ALERTA AO PASSAR DE US$ 190 MIL
-        # =====================================================
-        if side == "BUY" and accumulated >= ACCUMULATED_MIN_USD:
+        txt = (
+            f"🐋 *APOSTA ACUMULADA DETECTADA*\n\n"
+            f"🎯 *Mercado:* {title}\n"
+            f"📌 *Seleção:* {outcome}\n"
+            f"💰 *BUY acumulado:* ${buy_total:,.0f}\n"
+            f"🧾 *Entradas BUY:* {buy_count}\n"
+            f"🔴 *SELL acumulado:* ${sell_total:,.0f}\n"
+            f"📊 *Posição estimada:* "
+            f"${buy_total - sell_total:,.0f}\n"
+            f"👛 *Carteira:* `{wallet[:12]}...`\n\n"
+            f"🚨 *A carteira cruzou "
+            f"${ACCUMULATED_MIN_USD:,.0f} em BUY nessa seleção.*"
+        )
 
-            key = f"accumulated:{wallet}:{condition_id}:{outcome}"
+        chans = notifier.notify(txt)
 
-            if not DB.already_alerted(conn, key):
+        DB.mark_alerted(
+            conn,
+            alert_key,
+            "accumulated",
+        )
 
-                title = t.get("title") or "Mercado Polymarket"
+        new_alerts += 1
 
-                txt = (
-                    f"🐋 *APOSTA ACUMULADA DETECTADA*\n\n"
-                    f"🎯 *Mercado:* {title}\n"
-                    f"📌 *Seleção:* {outcome}\n"
-                    f"💰 *Acumulado:* ${accumulated:,.0f}\n"
-                    f"🧾 *Última entrada:* ${usd(t):,.0f}\n"
-                    f"👤 *Carteira:* `{wallet[:12]}...`\n\n"
-                    f"🚨 *Jogador acumulou mais de "
-                    f"${ACCUMULATED_MIN_USD:,.0f} na mesma seleção.*"
-                )
+        print(
+            f"ALERT [accumulated] "
+            f"{title[:50]} | {outcome} | "
+            f"BUY ${buy_total:,.0f} -> "
+            f"{chans or 'terminal'}"
+        )
 
-                chans = notifier.notify(txt)
+    # =========================================================
+    # 3) NOVOS SELL / REDUCAO DE POSICAO
+    #
+    # SOMENTE trades que entraram neste poll.
+    # =========================================================
+    for t in sorted(
+        new_trades,
+        key=lambda x: x.get("timestamp", 0),
+    ):
 
-                DB.mark_alerted(conn, key, "accumulated")
+        side = (t.get("side") or "").upper()
 
-                new_alerts += 1
+        if side != "SELL":
+            continue
 
-                print(
-                    f"ALERT [accumulated] "
-                    f"{title[:50]} | "
-                    f"{outcome} | "
-                    f"${accumulated:,.0f} -> "
-                    f"{chans or 'terminal'}"
-                )
+        wallet = (
+            t.get("proxyWallet")
+            or ""
+        ).lower()
 
-        # =====================================================
-        # 3) DETECTA SELL / RETIRADA
-        # Se o jogador ja acumulou >= US$ 190 mil em BUY
-        # e depois fizer SELL nessa mesma selecao.
-        # =====================================================
-        if side == "SELL":
+        condition_id = t.get("conditionId") or ""
+        outcome = t.get("outcome") or ""
+        sell_ts = int(t.get("timestamp", 0))
 
-            row = conn.execute(
-                """
-                SELECT COALESCE(SUM(usd), 0) AS bought
-                FROM trades
-                WHERE wallet = ?
-                  AND condition_id = ?
-                  AND outcome = ?
-                  AND side = 'BUY'
-                """,
-                (wallet, condition_id, outcome),
-            ).fetchone()
+        if not wallet or not condition_id or not outcome:
+            continue
 
-            bought = float(row["bought"] or 0)
+        # -----------------------------------------------------
+        # Descobre quando essa carteira atingiu US$ 190 mil.
+        # -----------------------------------------------------
+        buy_rows = conn.execute(
+            """
+            SELECT ts, usd
+            FROM trades
+            WHERE wallet=?
+              AND condition_id=?
+              AND outcome=?
+              AND side='BUY'
+            ORDER BY ts ASC
+            """,
+            (wallet, condition_id, outcome),
+        ).fetchall()
 
-            if bought >= ACCUMULATED_MIN_USD:
+        running_buy = 0.0
+        threshold_ts = None
 
-                sell_key = f"reverse:{trade_key(t)}"
+        for b in buy_rows:
+            running_buy += float(b["usd"] or 0)
 
-                if not DB.already_alerted(conn, sell_key):
+            if running_buy >= ACCUMULATED_MIN_USD:
+                threshold_ts = int(b["ts"])
+                break
 
-                    title = t.get("title") or "Mercado Polymarket"
+        # Nunca chegou a US$ 190 mil.
+        if threshold_ts is None:
+            continue
 
-                    txt = (
-                        f"🔴 *REVERSÃO / RETIRADA DETECTADA*\n\n"
-                        f"🎯 *Mercado:* {title}\n"
-                        f"📌 *Seleção:* {outcome}\n"
-                        f"💰 *Total comprado:* ${bought:,.0f}\n"
-                        f"🔴 *SELL detectado:* ${usd(t):,.0f}\n"
-                        f"👛 *Carteira:* `{wallet[:12]}...`\n\n"
-                        f"⚠️ *Esse jogador acumulou mais de "
-                        f"${ACCUMULATED_MIN_USD:,.0f} e começou "
-                        f"a retirar dinheiro dessa posição.*"
-                    )
+        # SELL precisa acontecer DEPOIS do cruzamento.
+        if sell_ts <= threshold_ts:
+            continue
 
-                    chans = notifier.notify(txt)
+        sell_key = f"reverse:{trade_key(t)}"
 
-                    DB.mark_alerted(conn, sell_key, "reverse")
+        if DB.already_alerted(conn, sell_key):
+            continue
 
-                    new_alerts += 1
+        # -----------------------------------------------------
+        # Calcula a posicao no momento exato do SELL.
+        # -----------------------------------------------------
+        totals = conn.execute(
+            """
+            SELECT
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN side='BUY' AND ts<=?
+                            THEN usd
+                            ELSE 0
+                        END
+                    ), 0
+                ) AS bought,
 
-                    print(
-                        f"ALERT [reverse] "
-                        f"{title[:50]} | "
-                        f"{outcome} | "
-                        f"SELL ${usd(t):,.0f} -> "
-                        f"{chans or 'terminal'}"
-                    )
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN side='SELL' AND ts<=?
+                            THEN usd
+                            ELSE 0
+                        END
+                    ), 0
+                ) AS sold
+
+            FROM trades
+            WHERE wallet=?
+              AND condition_id=?
+              AND outcome=?
+            """,
+            (
+                sell_ts,
+                sell_ts,
+                wallet,
+                condition_id,
+                outcome,
+            ),
+        ).fetchone()
+
+        bought = float(totals["bought"] or 0)
+        sold = float(totals["sold"] or 0)
+        position = bought - sold
+
+        title = (
+            t.get("title")
+            or "Mercado Polymarket"
+        )
+
+        txt = (
+            f"🔴 *REDUÇÃO DE POSIÇÃO DETECTADA*\n\n"
+            f"🎯 *Mercado:* {title}\n"
+            f"📌 *Seleção:* {outcome}\n"
+            f"👛 *Carteira:* `{wallet[:12]}...`\n\n"
+            f"💰 *BUY acumulado:* ${bought:,.0f}\n"
+            f"🔴 *SELL acumulado:* ${sold:,.0f}\n"
+            f"📊 *Posição estimada:* "
+            f"${position:,.0f}\n"
+            f"🔻 *Novo SELL:* ${usd(t):,.0f}\n\n"
+            f"⚠️ *Essa carteira havia cruzado "
+            f"${ACCUMULATED_MIN_USD:,.0f} em BUY "
+            f"e agora está reduzindo a posição.*"
+        )
+
+        chans = notifier.notify(txt)
+
+        DB.mark_alerted(
+            conn,
+            sell_key,
+            "reverse",
+        )
+
+        new_alerts += 1
+
+        print(
+            f"ALERT [reverse] "
+            f"{title[:50]} | {outcome} | "
+            f"SELL ${usd(t):,.0f} | "
+            f"position ${position:,.0f} -> "
+            f"{chans or 'terminal'}"
+        )
 
     conn.commit()
     conn.close()
@@ -301,7 +481,6 @@ def cmd_poll(args):
         f"{len(trades)} trades scanned, "
         f"{new_alerts} new alerts sent."
     )
-
 
 def cmd_consensus(args):
     """Find markets where several whales bought the same outcome recently."""
