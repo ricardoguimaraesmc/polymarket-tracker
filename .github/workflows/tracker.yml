@@ -3,7 +3,7 @@ name: Polymarket Whale Tracker
 # Jalan otomatis tiap 10 menit + bisa di-trigger manual.
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       min_usd:
