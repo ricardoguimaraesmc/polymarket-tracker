@@ -157,106 +157,150 @@ def accumulated_bet(conn, t):
 
     return float(row["total"] or 0), int(row["n"] or 0)
 def cmd_poll(args):
-    """One-shot: store trades, evaluate, send alerts for NEW hits. For cron/Actions."""
+    """Monitora acumulado de BUY e detecta SELL depois de grande acumulacao."""
     conn = DB.connect(args.db)
-    follow = _watchlist_set(conn)
-    score_cache = {}
+
+    # Aproximadamente R$ 990 mil
+    ACCUMULATED_MIN_USD = 190_000
+
     trades = fetch_trades(limit=args.lookback)
-    # store first so spike volume is computed against full history
+
+    # Salva os trades no banco
     for t in trades:
         DB.insert_trade(conn, t, usd(t))
+
     conn.commit()
+
     new_alerts = 0
-    # 1) per-trade alerts (whale / smart-money / watchlist)
+
+    # Processa em ordem cronologica
     for t in sorted(trades, key=lambda x: x.get("timestamp", 0)):
-        k = trade_key(t)
-        reasons, score = _evaluate(conn, t, args, follow, score_cache)
-        if not reasons or DB.already_alerted(conn, k):
+
+        wallet = (t.get("proxyWallet") or t.get("wallet") or "").lower()
+        condition_id = t.get("conditionId") or ""
+        outcome = t.get("outcome") or ""
+        side = (t.get("side") or "").upper()
+
+        if not wallet or not condition_id or not outcome:
             continue
-        chans = notifier.notify(alert_text(t, reasons, score))
-        DB.mark_alerted(conn, k, ",".join(reasons))
-        new_alerts += 1
-        print(f"ALERT [{','.join(reasons)}] {trade_line(t)} -> {chans or 'terminal'}")
-              # 1.5) accumulated bets: same wallet + same market + same outcome
-        # Alert when the same trader accumulates >= US$200k on the same selection.
-        ACCUMULATED_MIN_USD = 190_000
 
-        for t in trades:
-            wallet = t.get("proxyWallet") or t.get("wallet") or ""
-            condition_id = t.get("conditionId") or ""
-            outcome = t.get("outcome") or ""
+        # =====================================================
+        # 1) ACUMULADO DE BUY
+        # Mesmo jogador + mesmo mercado + mesma selecao
+        # =====================================================
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(usd), 0) AS total
+            FROM trades
+            WHERE wallet = ?
+              AND condition_id = ?
+              AND outcome = ?
+              AND side = 'BUY'
+            """,
+            (wallet, condition_id, outcome),
+        ).fetchone()
 
-            if not wallet or not condition_id or not outcome:
-                continue
+        accumulated = float(row["total"] or 0)
 
-            total_usd, bet_count = accumulated_bet(conn, t)
-
-            if total_usd < ACCUMULATED_MIN_USD:
-                continue
+        # =====================================================
+        # 2) ALERTA AO PASSAR DE US$ 190 MIL
+        # =====================================================
+        if side == "BUY" and accumulated >= ACCUMULATED_MIN_USD:
 
             key = f"accumulated:{wallet}:{condition_id}:{outcome}"
 
-            if DB.already_alerted(conn, key):
-                continue
+            if not DB.already_alerted(conn, key):
 
-            title = t.get("title") or "Mercado Polymarket"
+                title = t.get("title") or "Mercado Polymarket"
 
-            txt = (
-                f"🐋 *APOSTA ACUMULADA DETECTADA*\n\n"
-                f"🎯 *Mercado:* {title}\n"
-                f"📌 *Seleção:* {outcome}\n"
-                f"💰 *Acumulado:* ${total_usd:,.0f}\n"
-                f"🔢 *Entradas:* {bet_count}\n"
-                f"👤 *Carteira:* `{wallet[:12]}...`\n\n"
-                f"🚨 Mesmo jogador/carteira acumulou mais de "
-                f"${ACCUMULATED_MIN_USD:,.0f} na mesma seleção."
-            )
+                txt = (
+                    f"🐋 *APOSTA ACUMULADA DETECTADA*\n\n"
+                    f"🎯 *Mercado:* {title}\n"
+                    f"📌 *Seleção:* {outcome}\n"
+                    f"💰 *Acumulado:* ${accumulated:,.0f}\n"
+                    f"🧾 *Última entrada:* ${usd(t):,.0f}\n"
+                    f"👤 *Carteira:* `{wallet[:12]}...`\n\n"
+                    f"🚨 *Jogador acumulou mais de "
+                    f"${ACCUMULATED_MIN_USD:,.0f} na mesma seleção.*"
+                )
 
-            chans = notifier.notify(txt)
-            DB.mark_alerted(conn, key, "accumulated")
-            new_alerts += 1
+                chans = notifier.notify(txt)
 
-            print(
-                f"ALERT [accumulated] {title[:50]} | "
-                f"{outcome} | ${total_usd:,.0f} -> "
-                f"{chans or 'terminal'}"
-            )
-    # 2) one market-level spike alert per market per window (no per-trade spam)
-    if args.spike_usd > 0:
-        bucket = int(time.time()) // (args.spike_window * 60)
-        titles = {t.get("conditionId"): t.get("title") for t in trades}
-        for cid, vol in _spike_markets(conn, trades, args).items():
-            key = f"spike:{cid}:{bucket}"
-            if DB.already_alerted(conn, key):
-                continue
-            txt = (f"📈 *SPIKE* — volume {fmt_money(vol)} dalam {args.spike_window} menit terakhir\n"
-                   f"*{titles.get(cid,'?')}*\nMarket lagi rame, cek pergerakannya!")
-            chans = notifier.notify(txt)
-            DB.mark_alerted(conn, key, "spike")
-            new_alerts += 1
-            print(f"ALERT [spike] {titles.get(cid,'?')[:50]} vol={fmt_money(vol)} -> {chans or 'terminal'}")
-    # 3) smart-money consensus: several whales buying the same side of one market
-    if args.consensus_wallets > 0:
-        bucket = int(time.time()) // (args.consensus_window * 60)
-        since = int(time.time()) - args.consensus_window * 60
-        for g in DB.consensus_groups(conn, since, args.consensus_min_usd, args.consensus_wallets):
-            key = f"consensus:{g['condition_id']}:{g['outcome']}:{bucket}"
-            if DB.already_alerted(conn, key):
-                continue
-            buyers = DB.consensus_wallets(conn, g["condition_id"], g["outcome"],
-                                          since, args.consensus_min_usd)
-            who = "\n".join(f"  • {b['name'] or short(b['wallet'])} — {fmt_money(b['vol'])}"
-                            for b in buyers)
-            txt = (f"🎯 *CONSENSUS* — {g['n_wallets']} whales beli *{g['outcome']}* "
-                   f"dalam {args.consensus_window} menit (total {fmt_money(g['vol'])})\n"
-                   f"*{g['title']}*\n{who}\nSinyal kuat: smart money sepakat satu arah!")
-            chans = notifier.notify(txt)
-            DB.mark_alerted(conn, key, "consensus")
-            new_alerts += 1
-            print(f"ALERT [consensus] {g['title'][:50]} {g['n_wallets']}x {g['outcome']} -> {chans or 'terminal'}")
+                DB.mark_alerted(conn, key, "accumulated")
+
+                new_alerts += 1
+
+                print(
+                    f"ALERT [accumulated] "
+                    f"{title[:50]} | "
+                    f"{outcome} | "
+                    f"${accumulated:,.0f} -> "
+                    f"{chans or 'terminal'}"
+                )
+
+        # =====================================================
+        # 3) DETECTA SELL / RETIRADA
+        # Se o jogador ja acumulou >= US$ 190 mil em BUY
+        # e depois fizer SELL nessa mesma selecao.
+        # =====================================================
+        if side == "SELL":
+
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(usd), 0) AS bought
+                FROM trades
+                WHERE wallet = ?
+                  AND condition_id = ?
+                  AND outcome = ?
+                  AND side = 'BUY'
+                """,
+                (wallet, condition_id, outcome),
+            ).fetchone()
+
+            bought = float(row["bought"] or 0)
+
+            if bought >= ACCUMULATED_MIN_USD:
+
+                sell_key = f"reverse:{trade_key(t)}"
+
+                if not DB.already_alerted(conn, sell_key):
+
+                    title = t.get("title") or "Mercado Polymarket"
+
+                    txt = (
+                        f"🔴 *REVERSÃO / RETIRADA DETECTADA*\n\n"
+                        f"🎯 *Mercado:* {title}\n"
+                        f"📌 *Seleção:* {outcome}\n"
+                        f"💰 *Total comprado:* ${bought:,.0f}\n"
+                        f"🔴 *SELL detectado:* ${usd(t):,.0f}\n"
+                        f"👛 *Carteira:* `{wallet[:12]}...`\n\n"
+                        f"⚠️ *Esse jogador acumulou mais de "
+                        f"${ACCUMULATED_MIN_USD:,.0f} e começou "
+                        f"a retirar dinheiro dessa posição.*"
+                    )
+
+                    chans = notifier.notify(txt)
+
+                    DB.mark_alerted(conn, sell_key, "reverse")
+
+                    new_alerts += 1
+
+                    print(
+                        f"ALERT [reverse] "
+                        f"{title[:50]} | "
+                        f"{outcome} | "
+                        f"SELL ${usd(t):,.0f} -> "
+                        f"{chans or 'terminal'}"
+                    )
+
     conn.commit()
     conn.close()
-    print(f"\n✅ poll done. {len(trades)} trades scanned, {new_alerts} new alerts sent.")
+
+    print(
+        f"\n✅ poll done. "
+        f"{len(trades)} trades scanned, "
+        f"{new_alerts} new alerts sent."
+    )
 
 
 def cmd_consensus(args):
