@@ -134,7 +134,28 @@ def cmd_watch(args):
         conn.commit()
         conn.close()
 
+def accumulated_bet(conn, t):
+    """Soma BUYs da mesma carteira na mesma seleção/mercado."""
+    wallet = (t.get("proxyWallet") or "").lower()
+    condition_id = t.get("conditionId")
+    outcome = t.get("outcome")
 
+    if not wallet or not condition_id or not outcome:
+        return 0.0, 0
+
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(usd), 0) AS total, COUNT(*) AS n
+        FROM trades
+        WHERE wallet = ?
+          AND condition_id = ?
+          AND outcome = ?
+          AND side = 'BUY'
+        """,
+        (wallet, condition_id, outcome),
+    ).fetchone()
+
+    return float(row["total"] or 0), int(row["n"] or 0)
 def cmd_poll(args):
     """One-shot: store trades, evaluate, send alerts for NEW hits. For cron/Actions."""
     conn = DB.connect(args.db)
@@ -156,6 +177,50 @@ def cmd_poll(args):
         DB.mark_alerted(conn, k, ",".join(reasons))
         new_alerts += 1
         print(f"ALERT [{','.join(reasons)}] {trade_line(t)} -> {chans or 'terminal'}")
+              # 1.5) accumulated bets: same wallet + same market + same outcome
+        # Alert when the same trader accumulates >= US$200k on the same selection.
+        ACCUMULATED_MIN_USD = 190_000
+
+        for t in trades:
+            wallet = t.get("proxyWallet") or t.get("wallet") or ""
+            condition_id = t.get("conditionId") or ""
+            outcome = t.get("outcome") or ""
+
+            if not wallet or not condition_id or not outcome:
+                continue
+
+            total_usd, bet_count = accumulated_bet(conn, t)
+
+            if total_usd < ACCUMULATED_MIN_USD:
+                continue
+
+            key = f"accumulated:{wallet}:{condition_id}:{outcome}"
+
+            if DB.already_alerted(conn, key):
+                continue
+
+            title = t.get("title") or "Mercado Polymarket"
+
+            txt = (
+                f"🐋 *APOSTA ACUMULADA DETECTADA*\n\n"
+                f"🎯 *Mercado:* {title}\n"
+                f"📌 *Seleção:* {outcome}\n"
+                f"💰 *Acumulado:* ${total_usd:,.0f}\n"
+                f"🔢 *Entradas:* {bet_count}\n"
+                f"👤 *Carteira:* `{wallet[:12]}...`\n\n"
+                f"🚨 Mesmo jogador/carteira acumulou mais de "
+                f"${ACCUMULATED_MIN_USD:,.0f} na mesma seleção."
+            )
+
+            chans = notifier.notify(txt)
+            DB.mark_alerted(conn, key, "accumulated")
+            new_alerts += 1
+
+            print(
+                f"ALERT [accumulated] {title[:50]} | "
+                f"{outcome} | ${total_usd:,.0f} -> "
+                f"{chans or 'terminal'}"
+            )
     # 2) one market-level spike alert per market per window (no per-trade spam)
     if args.spike_usd > 0:
         bucket = int(time.time()) // (args.spike_window * 60)
