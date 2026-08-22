@@ -661,7 +661,7 @@ def cmd_watchlist(args):
 # ----------------------------- CLI -----------------------------
 def _add_filter_args(p, default_min):
     p.add_argument("--min-usd", type=float, default=default_min)
-    p.add_argument("--lookback", type=int, default=500)
+    p.add_argument("--lookback", type=int, default=10000)
     p.add_argument("--smart", action="store_true", help="hanya alert wallet smart-money")
     p.add_argument("--min-pnl", type=float, default=1000)
     p.add_argument("--min-winrate", type=float, default=0.5)
