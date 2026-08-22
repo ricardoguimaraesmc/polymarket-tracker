@@ -83,7 +83,7 @@ def alert_text(t, reasons, score=None):
 
 # ----------------------------- commands -----------------------------
 def cmd_scan(args):
-    trades = fetch_trades(limit=args.lookback)
+    trades = fetch_trades(limit=args.lookback, start=int(time.time()) - 600, end=int(time.time()))
     whales = [t for t in trades if usd(t) >= args.min_usd]
     whales.sort(key=usd, reverse=True)
     print(f"\n🐋 WHALE SCAN — {len(whales)} trade >= {fmt_money(args.min_usd)} "
