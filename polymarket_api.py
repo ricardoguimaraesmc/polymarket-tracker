@@ -166,7 +166,7 @@ def _trade_identity(t):
     )
 
 
-def _fetch_window(start, end, limit=MAX_PAGE, depth=0, max_depth=3):
+def _fetch_window(start, end, limit=MAX_PAGE, depth=0, max_depth=5):
     """Fetch a bounded time window without unbounded recursive pagination.
 
     The previous implementation fetched two 10k pages and recursively split
