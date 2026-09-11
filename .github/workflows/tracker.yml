@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       min_usd:
-        description: "Minimal USD buat dianggap whale"
+        description: "Minimal USD para considerado whale"
         required: false
         default: "5000"
 
@@ -32,7 +32,7 @@ jobs:
         with:
           path: |
             tracker.db
-            market_cache.json
+            .polymarket_market_cache.json
           key: tracker-db-${{ github.run_id }}
           restore-keys: |
             tracker-db-
@@ -41,6 +41,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          python3 whale_tracker.py poll             --min-usd "${{ github.event.inputs.min_usd || '5000' }}"             --smart --min-pnl 5000 --min-winrate 0.55             --spike-usd 25000 --spike-window 30             --consensus-wallets 3 --consensus-window 60 --consensus-min-usd 1000
+          python3 whale_tracker.py poll \
+            --min-usd "${{ github.event.inputs.min_usd || '5000' }}" \
+            --smart --min-pnl 5000 --min-winrate 0.55 \
+            --spike-usd 25000 --spike-window 30 \
+            --consensus-wallets 3 --consensus-window 60 --consensus-min-usd 1000
