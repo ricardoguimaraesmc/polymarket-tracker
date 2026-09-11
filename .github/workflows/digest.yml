@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 concurrency:
   group: whale-tracker
@@ -23,17 +22,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Restore the same persisted SQLite database used by the tracker.
-      - name: Download previous database
-        uses: dawidd6/action-download-artifact@v23
+      - name: Restore tracker state
+        uses: actions/cache@v4
         with:
-          workflow: tracker.yml
-          workflow_conclusion: success
-          name: tracker-db
-          path: .
-          search_artifacts: true
-          if_no_artifact_found: warn
-        continue-on-error: true
+          path: |
+            tracker.db
+            .polymarket_market_cache.json
+          key: tracker-db-${{ github.run_id }}
+          restore-keys: |
+            tracker-db-
 
       - name: Send digest
         env:
