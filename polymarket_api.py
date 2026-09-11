@@ -1,119 +1,138 @@
-"""Thin read-only client for Polymarket's public Data API (stdlib only)."""
+"""Read-only client for Polymarket public APIs."""
 import json
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 
 BASE = "https://data-api.polymarket.com"
-_UA = {"User-Agent": "polymarket-whale-tracker/2.0"}
+_UA = {"User-Agent": "shark-money-tracker/3.0"}
+MAX_PAGE = 10_000
+MAX_OFFSET = 10_000
 
-MAX_PAGE = 10000
 
-
-def _get(path, params=None, timeout=30):
+def _get(path, params=None, timeout=30, retries=3):
     url = f"{BASE}{path}"
     if params:
-        clean = {k: v for k, v in params.items() if v is not None}
-        url += "?" + urllib.parse.urlencode(clean)
+        url += "?" + urllib.parse.urlencode(params)
 
-    req = urllib.request.Request(url, headers=_UA)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    last = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=_UA)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code not in (429, 500, 502, 503, 504) or attempt == retries - 1:
+                raise
+        except (urllib.error.URLError, TimeoutError, TimeoutError) as e:
+            last = e
+            if attempt == retries - 1:
+                raise
+        time.sleep(1.5 * (2 ** attempt))
+    raise last
+
+
+def _trade_identity(t):
+    return (
+        f"{t.get('transactionHash','')}:"
+        f"{t.get('asset','')}:"
+        f"{t.get('timestamp','')}:"
+        f"{t.get('proxyWallet','')}"
+    )
 
 
 def _fetch_window(start, end, limit=MAX_PAGE):
-    """Fetch all trades in a time window, recursively splitting crowded windows."""
-    if start >= end:
+    """Fetch a complete time window, recursively splitting when pagination is full.
+
+    Polymarket's current Data API documents max limit=10,000 and max offset=10,000.
+    Therefore one unsplit query can expose at most 20,000 rows. If both pages are
+    full, split the time window and repeat. This removes the old shallow-lookback
+    bottleneck for the global trade feed.
+    """
+    start = int(start)
+    end = int(end)
+    if end <= start:
         return []
 
-    # First page: explicitly include both taker and maker trades.
-    params = {
+    first = _get("/trades", {
         "limit": min(int(limit), MAX_PAGE),
         "offset": 0,
         "takerOnly": "false",
-        "start": int(start),
-        "end": int(end),
-    }
+        "start": start,
+        "end": end,
+    })
 
-    first = _get("/trades", params)
     if not isinstance(first, list):
         return []
 
-    rows = list(first)
-
-    # If fewer than the page cap were returned, the whole window fits.
     if len(first) < MAX_PAGE:
-        return rows
+        return first
 
-    # The endpoint caps offset at 10,000. Fetch the second page.
-    second = _get(
-        "/trades",
-        {
-            "limit": MAX_PAGE,
-            "offset": MAX_PAGE,
-            "takerOnly": "false",
-            "start": int(start),
-            "end": int(end),
-        },
-    )
+    second = _get("/trades", {
+        "limit": MAX_PAGE,
+        "offset": MAX_OFFSET,
+        "takerOnly": "false",
+        "start": start,
+        "end": end,
+    })
 
     if not isinstance(second, list):
         second = []
 
-    rows.extend(second)
+    combined = first + second
 
-    # If the second page is also full, the window may contain more than
-    # the API's offset budget. Split the time window and fetch both halves.
+    # If the second page is also full, there may be more than the endpoint's
+    # 20,000-row offset budget in this window. Split by timestamp.
     if len(second) >= MAX_PAGE:
-        mid = (int(start) + int(end)) // 2
+        mid = (start + end) // 2
         if mid <= start or mid >= end:
-            return rows
+            return combined
 
         left = _fetch_window(start, mid, limit)
-        right = _fetch_window(mid + 1, end, limit)
+        right = _fetch_window(mid, end, limit)
+        return left + right
 
-        # Return the split-window result; dedupe below.
-        rows = left + right
-
-    # Deduplicate by the same trade identity used by the tracker.
-    unique = {}
-    for t in rows:
-        key = trade_key(t)
-        unique[key] = t
-
-    return list(unique.values())
+    return combined
 
 
 def fetch_trades(limit=MAX_PAGE, offset=0, start=None, end=None):
-    """Fetch public trades.
+    """Fetch public trades, including maker and taker fills.
 
-    For normal calls, returns up to 10,000 recent trades.
-    When start/end are supplied, automatically paginates/splits crowded
-    time windows so a busy five-minute polling cycle does not silently
-    lose trades at the 10,000/offset API caps.
+    When start/end are supplied, the window-aware paginator recursively splits
+    crowded periods so the 10k limit / 10k offset ceiling does not truncate it.
     """
-    limit = min(int(limit), MAX_PAGE)
-
     if start is not None or end is not None:
         now = int(time.time())
-        start = now - 300 if start is None else int(start)
+        start = now - 600 if start is None else int(start)
         end = now if end is None else int(end)
-
-        return _fetch_window(start, end, limit)
-
-    return _get(
-        "/trades",
-        {
-            "limit": limit,
-            "offset": min(max(int(offset), 0), MAX_PAGE),
+        rows = _fetch_window(start, end, min(int(limit), MAX_PAGE))
+    else:
+        rows = _get("/trades", {
+            "limit": min(int(limit), MAX_PAGE),
+            "offset": min(int(offset), MAX_OFFSET),
             "takerOnly": "false",
-        },
-    )
+        })
+
+    seen = set()
+    out = []
+    for t in rows or []:
+        k = _trade_identity(t)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
 
 
 def fetch_positions(wallet, limit=200):
-    return _get("/positions", {"user": wallet, "limit": limit,
-                               "sortBy": "CURRENT", "sortDirection": "DESC"})
+    return _get("/positions", {
+        "user": wallet,
+        "limit": min(int(limit), 500),
+        "sortBy": "CURRENT",
+        "sortDirection": "DESC",
+    })
 
 
 def fetch_value(wallet):
@@ -126,4 +145,4 @@ def usd(trade):
 
 
 def trade_key(t):
-    return f"{t.get('transactionHash','')}:{t.get('asset','')}:{t.get('timestamp','')}"
+    return _trade_identity(t)
