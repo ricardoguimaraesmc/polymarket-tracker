@@ -54,12 +54,15 @@ def fetch_markets_by_condition_ids(condition_ids, chunk_size=100):
     result = {}
     for i in range(0, len(ids), max(1, int(chunk_size))):
         chunk = ids[i:i + max(1, int(chunk_size))]
-        # The API documents array parameters as comma-separated lists.
-        payload = _gamma_get("/markets", {
-            "condition_ids": ",".join(chunk),
-            "limit": len(chunk),
-            "include_tag": "true",
-        })
+        # condition_ids is documented as string[]; send repeated query
+        # parameters (condition_ids=id1&condition_ids=id2&...) rather than
+        # one comma-joined value, which Gamma may interpret as a single ID.
+        params = [("condition_ids", cid) for cid in chunk]
+        params.extend([
+            ("limit", len(chunk)),
+            ("include_tag", "true"),
+        ])
+        payload = _gamma_get("/markets", params)
         if isinstance(payload, list):
             for market in payload:
                 cid = str(market.get("conditionId") or "").strip()
