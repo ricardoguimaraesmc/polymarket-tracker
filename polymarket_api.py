@@ -11,6 +11,62 @@ MAX_PAGE = 10_000
 MAX_OFFSET = 10_000
 
 
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+
+
+def _gamma_get(path, params=None, timeout=20, retries=3):
+    url = f"{GAMMA_BASE}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params, doseq=True)
+    last = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=_UA)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code not in (429, 500, 502, 503, 504) or attempt == retries - 1:
+                raise
+        except (urllib.error.URLError, TimeoutError) as e:
+            last = e
+            if attempt == retries - 1:
+                raise
+        time.sleep(0.75 * (2 ** attempt))
+    raise last
+
+
+def fetch_markets_by_condition_ids(condition_ids, chunk_size=50):
+    """Batch-resolve Gamma market metadata for many condition IDs.
+
+    Gamma accepts condition_ids as a repeated/comma-separated array parameter.
+    Batching avoids one HTTP request per trade/market.
+    """
+    ids = []
+    seen = set()
+    for cid in condition_ids or []:
+        cid = str(cid or "").strip()
+        if cid and cid not in seen:
+            seen.add(cid)
+            ids.append(cid)
+
+    result = {}
+    for i in range(0, len(ids), max(1, int(chunk_size))):
+        chunk = ids[i:i + max(1, int(chunk_size))]
+        # The API documents array parameters as comma-separated lists.
+        payload = _gamma_get("/markets", {
+            "condition_ids": ",".join(chunk),
+            "limit": len(chunk),
+            "include_tag": "true",
+        })
+        if isinstance(payload, list):
+            for market in payload:
+                cid = str(market.get("conditionId") or "").strip()
+                if cid:
+                    result[cid] = market
+    return result
+
+
 def _get(path, params=None, timeout=30, retries=3):
     url = f"{BASE}{path}"
     if params:
