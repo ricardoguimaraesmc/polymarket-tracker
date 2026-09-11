@@ -35,7 +35,8 @@ from datetime import datetime, timezone
 
 import db as DB
 import notifier
-from polymarket_api import fetch_trades, fetch_positions, fetch_value, usd, trade_key, fetch_markets_by_condition_ids
+from polymarket_api import (fetch_trades, fetch_positions, fetch_value, usd, trade_key,
+                              fetch_markets_by_condition_ids)
 from smartmoney import score_wallet, is_smart
 
 
@@ -45,8 +46,9 @@ MIN_ENTRY_PRICE = 1.0 / MIN_ENTRY_ODD
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 MARKET_CACHE_FILE = ".polymarket_market_cache.json"
 
-# Common Polymarket sports terms. Metadata from Gamma is the primary classifier;
-# these are only a fallback if metadata is temporarily unavailable.
+# Common sports/e-sports/virtual-sports hints. Gamma metadata remains the
+# authoritative classifier; these terms are only useful for diagnostics and
+# future fallbacks and MUST NOT turn an unknown market into an alert.
 SPORTS_FALLBACK_TERMS = (
     "football", "soccer", "basketball", "tennis", "baseball", "hockey",
     "volleyball", "rugby", "cricket", "golf", "boxing", "mma", "ufc",
@@ -55,62 +57,33 @@ SPORTS_FALLBACK_TERMS = (
     "badminton", "wrestling", "esports", "e-sports", "counter-strike",
     "counter strike", "valorant", "league of legends", "lol esports",
     "dota", "dota 2", "rocket league", "overwatch", "call of duty",
-    "starcraft", "rainbow six", "league of legends", "mlbb",
-    "virtual football", "virtual soccer", "virtual basketball",
-    "virtual tennis", "virtual sports"
+    "starcraft", "rainbow six", "mlbb", "virtual football",
+    "virtual soccer", "virtual basketball", "virtual tennis", "virtual sports"
 )
 
 TRANSLATIONS = {
-    "moneyline": "vencedor da partida",
-    "match winner": "vencedor da partida",
-    "game winner": "vencedor do jogo",
-    "winner": "vencedor",
-    "to win": "para vencer",
-    "win": "vencer",
-    "draw": "empate",
-    "tie": "empate",
-    "over": "mais de",
-    "under": "menos de",
-    "both teams to score": "ambas marcam",
-    "yes": "sim",
-    "no": "não",
-    "spread": "handicap",
-    "asian handicap": "handicap asiático",
-    "handicap": "handicap",
-    "total goals": "total de gols",
-    "total points": "total de pontos",
-    "total games": "total de games",
-    "total sets": "total de sets",
-    "total maps": "total de mapas",
-    "match": "partida",
-    "game": "jogo",
-    "set": "set",
-    "map": "mapa",
-    "first half": "primeiro tempo",
-    "second half": "segundo tempo",
-    "quarter": "quarto",
-    "round": "round",
-    "final": "final",
-    "semi-final": "semifinal",
-    "semifinals": "semifinais",
-    "quarter-final": "quartas de final",
-    "quarterfinal": "quartas de final",
-    "playoffs": "playoffs",
-    "qualifier": "qualificatória",
-    "qualifiers": "qualificatórias",
-    "correct score": "placar exato",
-    "win or draw": "vitória ou empate",
-    "double chance": "dupla chance",
+    "moneyline": "vencedor da partida", "match winner": "vencedor da partida",
+    "game winner": "vencedor do jogo", "winner": "vencedor",
+    "to win": "para vencer", "win": "vencer", "draw": "empate",
+    "tie": "empate", "over": "mais de", "under": "menos de",
+    "both teams to score": "ambas marcam", "yes": "sim", "no": "não",
+    "spread": "handicap", "asian handicap": "handicap asiático",
+    "handicap": "handicap", "total goals": "total de gols",
+    "total points": "total de pontos", "total games": "total de games",
+    "total sets": "total de sets", "total maps": "total de mapas",
+    "match": "partida", "game": "jogo", "first half": "primeiro tempo",
+    "second half": "segundo tempo", "quarter": "quarto",
+    "semi-final": "semifinal", "semifinals": "semifinais",
+    "quarter-final": "quartas de final", "quarterfinal": "quartas de final",
+    "playoffs": "playoffs", "qualifier": "qualificatória",
+    "qualifiers": "qualificatórias", "correct score": "placar exato",
+    "win or draw": "vitória ou empate", "double chance": "dupla chance",
     "first team to score": "primeiro time a marcar",
     "last team to score": "último time a marcar",
-    "to qualify": "para se classificar",
-    "advance": "avançar",
-    "series winner": "vencedor da série",
-    "race winner": "vencedor da corrida",
-    "podium": "pódio",
-    "set winner": "vencedor do set",
-    "map winner": "vencedor do mapa",
-    "round winner": "vencedor do round",
+    "to qualify": "para se classificar", "advance": "avançar",
+    "series winner": "vencedor da série", "race winner": "vencedor da corrida",
+    "podium": "pódio", "set winner": "vencedor do set",
+    "map winner": "vencedor do mapa", "round winner": "vencedor do round",
 }
 
 def _load_market_cache():
@@ -123,28 +96,60 @@ def _load_market_cache():
         return {}
 
 _MARKET_CACHE = _load_market_cache()
-_MARKET_FAIL_CACHE = {}
-_CLOB_GST_CACHE = {}
-
 _RUN_MARKET_CACHE = {}
+_MARKET_FAIL_CACHE = {}
+def _text_sports_hint(t):
+    text = " ".join(
+        str(t.get(k) or "")
+        for k in ("title", "eventSlug", "slug", "outcome")
+    ).lower()
+    return any(term in text for term in SPORTS_FALLBACK_TERMS)
 
 
 def _prime_market_cache(condition_ids):
-    """Resolve many markets in one Gamma request and merge into the persistent cache."""
-    ids = [str(x or "").strip() for x in condition_ids or [] if str(x or "").strip()]
-    missing = [cid for cid in dict.fromkeys(ids)
-               if cid not in _MARKET_CACHE and cid not in _RUN_MARKET_CACHE]
+    """Resolve many markets in a few Gamma calls and cache the results.
+
+    The Gamma API supports condition_ids as a string-array query parameter.
+    We batch in groups of 50 to keep URLs comfortably sized.
+    """
+    ids = []
+    seen = set()
+    for x in condition_ids or []:
+        cid = str(x or "").strip()
+        if cid and cid not in seen:
+            seen.add(cid)
+            ids.append(cid)
+
+    missing = [cid for cid in ids
+               if cid not in _MARKET_CACHE and cid not in _RUN_MARKET_CACHE
+               and cid not in _MARKET_FAIL_CACHE]
     if not missing:
-        return
+        return 0
+
+    loaded = 0
     try:
-        batch = fetch_markets_by_condition_ids(missing, chunk_size=50)
-        for cid, meta in batch.items():
-            _RUN_MARKET_CACHE[cid] = meta or {}
-            _MARKET_CACHE[cid] = meta or {}
-        if batch:
+        for i in range(0, len(missing), 100):
+            batch_ids = missing[i:i + 100]
+            batch = fetch_markets_by_condition_ids(batch_ids, chunk_size=100)
+            for cid in batch_ids:
+                meta = batch.get(cid)
+                if meta is not None:
+                    _RUN_MARKET_CACHE[cid] = meta
+                    _MARKET_CACHE[cid] = meta
+                    loaded += 1
+                else:
+                    _MARKET_FAIL_CACHE[cid] = time.time()
+        if loaded:
             _save_market_cache()
     except Exception as exc:
+        # Fail closed: an API failure must not turn an unknown market into a
+        # sports alert. Mark this batch as failed for a short period so the
+        # same run does not hammer Gamma repeatedly.
+        now = time.time()
+        for cid in missing:
+            _MARKET_FAIL_CACHE[cid] = now
         print(f"[gamma] batch metadata warning: {exc}", file=sys.stderr)
+    return loaded
 
 
 def _market_for_trade(t):
@@ -157,15 +162,15 @@ def _market_for_trade(t):
     if cached:
         _RUN_MARKET_CACHE[cid] = cached
         return cached
+    if cid in _MARKET_FAIL_CACHE and time.time() - _MARKET_FAIL_CACHE[cid] < 120:
+        return None
     _prime_market_cache([cid])
     return _RUN_MARKET_CACHE.get(cid)
-
 
 
 def _save_market_cache():
     try:
         import json, os
-        # Keep only the newest 5000 entries by insertion order.
         if len(_MARKET_CACHE) > 5000:
             keep = list(_MARKET_CACHE.items())[-5000:]
             _MARKET_CACHE.clear()
@@ -177,23 +182,6 @@ def _save_market_cache():
     except Exception:
         pass
 
-def _gamma_market(condition_id):
-    """Resolve official Gamma metadata from run/persistent cache, then batch fallback."""
-    cid = (condition_id or "").strip()
-    if not cid:
-        return None
-    meta = _market_for_trade({"conditionId": cid})
-    if meta is not None:
-        return meta
-    failed_at = _MARKET_FAIL_CACHE.get(cid, 0)
-    if failed_at and time.time() - failed_at < 60:
-        return None
-    try:
-        _prime_market_cache([cid])
-        return _RUN_MARKET_CACHE.get(cid) or None
-    except Exception:
-        _MARKET_FAIL_CACHE[cid] = time.time()
-        return None
 
 def _is_sports_metadata(meta):
     if not meta:
@@ -203,34 +191,33 @@ def _is_sports_metadata(meta):
     market_type = str(meta.get("marketType") or "").strip().lower()
     sports_market_type = str(meta.get("sportsMarketType") or "").strip().lower()
 
-    # Official sports-specific metadata is stronger than title keywords.
-    # Polymarket exposes gameId/team IDs/sportsMarketType on sports markets.
+    # Official sports fields are authoritative. Gamma exposes these on sports
+    # markets, including e-sports and virtual sports.
     if sports_market_type or meta.get("gameId") or meta.get("teamAID") or meta.get("teamBID"):
         return True
 
     text = " ".join([category, subcategory, market_type])
     if "sport" in text or "esport" in text:
         return True
-    tags = meta.get("tags") or []
-    for tag in tags:
+
+    for tag in meta.get("tags") or []:
         if isinstance(tag, dict):
-            s = " ".join(str(tag.get(k) or "") for k in ("slug", "label", "name")).lower()
+            value = " ".join(str(tag.get(k) or "") for k in ("slug", "label", "name")).lower()
         else:
-            s = str(tag).lower()
-        if "sport" in s or "esport" in s:
+            value = str(tag).lower()
+        if "sport" in value or "esport" in value:
             return True
     return False
 
-def is_sports_trade(t):
-    """Fail-closed sports classifier.
 
-    Official Gamma metadata is authoritative. If the metadata lookup fails,
-    the trade is NOT classified as sports; this prevents politics/crypto/etc.
-    from leaking through because a title happens to contain a sports word.
-    """
-    meta = _gamma_market(t.get("conditionId"))
-    if not meta:
+def is_sports_trade(t):
+    """Fail-closed classifier using cached official Gamma market metadata."""
+    cid = str(t.get("conditionId") or "").strip()
+    if not cid:
         return False
+    meta = _MARKET_CACHE.get(cid) or _RUN_MARKET_CACHE.get(cid)
+    if meta is None:
+        meta = _market_for_trade(t)
     return _is_sports_metadata(meta)
 
 def implied_odd(t):
@@ -256,42 +243,24 @@ def _parse_iso_ts(value):
         return None
 
 def event_phase(t):
-    """Classify the trade as PRÉ-LIVE or AO VIVO using official market timing."""
+    """Classify PRÉ-LIVE/AO VIVO from cached official Gamma sports timing."""
     meta = _market_for_trade(t) or {}
     now_ts = int(time.time())
 
-    # Sports CLOB metadata exposes the actual game start time (gst).
-    # This is more precise than using the market creation/start date.
-    cid = t.get("conditionId")
-    if cid:
-        cid = str(cid)
-        start = _CLOB_GST_CACHE.get(cid)
-        if start is None:
-            try:
-                from urllib.request import Request, urlopen
-                import json
-                req = Request(
-                    "https://clob.polymarket.com/clob-markets/" + cid,
-                    headers={"User-Agent": "SharkMoney/1.0"},
-                )
-                with urlopen(req, timeout=6) as resp:
-                    clob = json.loads(resp.read().decode("utf-8"))
-                start = _parse_iso_ts(clob.get("gst"))
-                _CLOB_GST_CACHE[cid] = start
-            except Exception:
-                start = None
-            if start is not None:
-                return "🔴 AO VIVO" if now_ts >= start else "🟢 PRÉ-LIVE"
-        else:
-            return "🔴 AO VIVO" if now_ts >= start else "🟢 PRÉ-LIVE"
+    # Gamma sports market data exposes event/game start time. Its parent event
+    # can also expose a live flag. Avoid one CLOB HTTP request per alert.
+    for ev in meta.get("events") or []:
+        if ev.get("live") is True:
+            return "🔴 AO VIVO"
+    if meta.get("live") is True:
+        return "🔴 AO VIVO"
 
-    # Fallback to Gamma timing fields.
-    for key in ("gameStartTime", "game_start_time", "startDate", "start_date"):
+    for key in ("eventStartTime", "gameStartTime", "event_start_time", "game_start_time",
+                "startDate", "start_date"):
         start = _parse_iso_ts(meta.get(key))
         if start is not None:
             return "🔴 AO VIVO" if now_ts >= start else "🟢 PRÉ-LIVE"
 
-    # Never guess the phase when the official timing could not be confirmed.
     return "⚪ STATUS INDETERMINADO"
 
 def _translate_text(text):
@@ -511,54 +480,83 @@ def cmd_poll(args):
     # Aproximadamente R$ 990 mil
     ACCUMULATED_MIN_USD = 190_000
 
-    # GitHub Actions roda a cada ~5 min. Usamos 10 min de sobreposição para
-    # não perder trades entre execuções. O fetch_trades robusto divide janelas
-    # lotadas automaticamente quando ultrapassam o limite de paginação.
+    # GitHub Actions roda a cada ~5 min. Mantemos uma sobreposição de 7 min
+    # para tolerar pequenos atrasos entre execuções.
     now = int(time.time())
+    fetch_started = time.time()
     trades = fetch_trades(
         limit=args.lookback,
-        start=now - 600,
+        start=now - 420,
         end=now,
     )
+    fetch_elapsed = time.time() - fetch_started
+    print(f"[poll] trades={len(trades)} fetched in {fetch_elapsed:.1f}s")
 
-    # Somente BUY esportivo com odd >= 1,50 entra no Shark Money.
-    # SELL é guardado apenas quando o mercado já é elegível, para detectar
-    # redução de posição depois do cruzamento dos US$ 190 mil.
     new_trades = []
-
-    # First handle BUY candidates. Odd filtering happens locally, before any
-    # metadata request, and all candidate markets are resolved in batches.
     buy_candidates = []
-    buy_cids = set()
     sell_candidates = []
+    metadata_needed = set()
 
     for t in trades:
         side = (t.get("side") or "").upper()
         cid = str(t.get("conditionId") or "").strip()
         if not cid:
             continue
+
         if side == "BUY":
             if not odd_allowed(t):
                 continue
             buy_candidates.append(t)
-            buy_cids.add(cid)
+            # Resolve every uncached candidate by conditionId. This is deliberate:
+            # title/slug keyword heuristics can miss esports, virtual sports,
+            # team-only names, and non-English markets. Batch requests keep this
+            # bounded while preserving a fail-closed official metadata classifier.
+            if cid not in _MARKET_CACHE and cid not in _RUN_MARKET_CACHE:
+                metadata_needed.add(cid)
+
         elif side == "SELL":
             sell_candidates.append(t)
 
-    _prime_market_cache(buy_cids)
+    # Resolve BUY candidates in batches. This is the only metadata work needed
+    # for normal entries and avoids one HTTP request per trade.
+    if metadata_needed:
+        meta_started = time.time()
+        print(f"[poll] resolving {len(metadata_needed)} uncached BUY markets")
+        loaded = _prime_market_cache(metadata_needed)
+        print(f"[poll] metadata resolved: {loaded}/{len(metadata_needed)} in {time.time() - meta_started:.1f}s")
 
-    # Insert eligible BUYs first. SELLs are evaluated later and only queried
-    # for metadata if their wallet/market/outcome already has >= $190k in
-    # eligible BUYs. This prevents thousands of irrelevant SELL metadata calls.
+    # For SELLs, only markets whose existing eligible BUY total is already at
+    # least $190k need metadata. Resolve those IDs in one batch too.
+    sell_metadata_needed = set()
+    sell_qualified = []
+    for t in sell_candidates:
+        wallet = (t.get("proxyWallet") or "").lower()
+        condition_id = t.get("conditionId") or ""
+        outcome = t.get("outcome") or ""
+        if not wallet or not condition_id or not outcome:
+            continue
+        row = conn.execute(
+            """SELECT COALESCE(SUM(usd),0) AS total FROM trades
+               WHERE wallet=? AND condition_id=? AND outcome=?
+               AND side='BUY' AND price <= ?""",
+            (wallet, condition_id, outcome, MIN_ENTRY_PRICE),
+        ).fetchone()
+        if float(row["total"] or 0) >= ACCUMULATED_MIN_USD:
+            sell_qualified.append(t)
+            if condition_id not in _MARKET_CACHE and condition_id not in _RUN_MARKET_CACHE:
+                sell_metadata_needed.add(condition_id)
+    if sell_metadata_needed:
+        sell_started = time.time()
+        print(f"[poll] resolving {len(sell_metadata_needed)} uncached SELL markets")
+        loaded = _prime_market_cache(sell_metadata_needed)
+        print(f"[poll] SELL metadata resolved: {loaded}/{len(sell_metadata_needed)} in {time.time() - sell_started:.1f}s")
+
+    # Insert eligible BUYs first.
     for t in buy_candidates:
         if not _eligible_entry(t):
             continue
 
-        tx_key = (
-            f"{t.get('transactionHash', '')}:"
-            f"{t.get('asset', '')}:"
-            f"{t.get('timestamp', '')}"
-        )
+        tx_key = trade_key(t)
 
         exists = conn.execute(
             "SELECT 1 FROM trades WHERE tx_key=?",
@@ -569,36 +567,19 @@ def cmd_poll(args):
             DB.insert_trade(conn, t, usd(t))
             new_trades.append(t)
 
-    # Only consider SELLs that belong to an already-qualified Shark position.
-    # This avoids resolving sports metadata for unrelated SELL traffic.
-    for t in sell_candidates:
+    # Only consider SELLs belonging to a position that has already crossed
+    # US$190k in eligible BUYs.
+    for t in sell_qualified:
         wallet = (t.get("proxyWallet") or "").lower()
         condition_id = t.get("conditionId") or ""
         outcome = t.get("outcome") or ""
         if not wallet or not condition_id or not outcome:
             continue
 
-        row = conn.execute(
-            """
-            SELECT COALESCE(SUM(usd),0) AS total
-            FROM trades
-            WHERE wallet=? AND condition_id=? AND outcome=?
-              AND side='BUY' AND price <= ?
-            """,
-            (wallet, condition_id, outcome, MIN_ENTRY_PRICE),
-        ).fetchone()
-        if float(row["total"] or 0) < ACCUMULATED_MIN_USD:
-            continue
-
-        _prime_market_cache([condition_id])
         if not is_sports_trade(t):
             continue
 
-        tx_key = (
-            f"{t.get('transactionHash', '')}:"
-            f"{t.get('asset', '')}:"
-            f"{t.get('timestamp', '')}"
-        )
+        tx_key = trade_key(t)
         exists = conn.execute(
             "SELECT 1 FROM trades WHERE tx_key=?",
             (tx_key,),
@@ -632,8 +613,15 @@ def cmd_poll(args):
         (MIN_ENTRY_PRICE, MIN_ENTRY_PRICE, ACCUMULATED_MIN_USD),
     ).fetchall()
 
-    # Resolve only markets that actually crossed the accumulation threshold.
-    _prime_market_cache([g["condition_id"] for g in groups])
+    # Resolve only markets that actually crossed the accumulation threshold
+    # and are not already present in the sports catalogue/cache.
+    group_missing = []
+    for g in groups:
+        cid = str(g["condition_id"] or "").strip()
+        if cid and cid not in _MARKET_CACHE and cid not in _RUN_MARKET_CACHE:
+            group_missing.append(cid)
+    if group_missing:
+        _prime_market_cache(group_missing)
 
     # =========================================================
     # 2) ALERTA DE BUY ACUMULADO
@@ -720,8 +708,8 @@ def cmd_poll(args):
 
         txt = (
             f"🐋 *SHARK MONEY — ENTRADA ACUMULADA*\n\n"
-            f"🏆 *Evento:* {ctx['title_pt']}\n"
-            f"🎯 *Entrada:* {ctx['outcome_pt']}\n"
+            f"🏆 *Evento:* {_md_dynamic(ctx['title_pt'])}\n"
+            f"🎯 *Entrada:* {_md_dynamic(ctx['outcome_pt'])}\n"
             f"📊 *Odd:* {odd:.2f}\n"
             f"💵 *Preço/Probabilidade:* {threshold_price:.3f} ({threshold_price*100:.1f}%)\n"
             f"⏱️ *Momento:* {phase}\n"
@@ -735,6 +723,9 @@ def cmd_poll(args):
         )
 
         chans = notifier.notify(txt)
+        if not chans:
+            print("[alert] Telegram/Discord delivery failed; alert remains pending", file=sys.stderr)
+            continue
         DB.mark_alerted(conn, alert_key, "accumulated")
         new_alerts += 1
 
@@ -806,8 +797,8 @@ def cmd_poll(args):
 
         txt = (
             f"🔴 *SHARK MONEY — REDUÇÃO DE POSIÇÃO*\n\n"
-            f"🏆 *Evento:* {ctx['title_pt']}\n"
-            f"🎯 *Entrada:* {ctx['outcome_pt']}\n"
+            f"🏆 *Evento:* {_md_dynamic(ctx['title_pt'])}\n"
+            f"🎯 *Entrada:* {_md_dynamic(ctx['outcome_pt'])}\n"
             f"📊 *Odd atual:* {odd:.2f}" if odd else
             f"📊 *Odd atual:* indisponível"
         )
@@ -825,6 +816,9 @@ def cmd_poll(args):
         )
 
         chans = notifier.notify(txt)
+        if not chans:
+            print("[alert] Telegram/Discord delivery failed; SELL alert remains pending", file=sys.stderr)
+            continue
         DB.mark_alerted(conn, sell_key, "reverse")
         new_alerts += 1
 
