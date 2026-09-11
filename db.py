@@ -26,6 +26,7 @@ def _init(conn):
         CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
         CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(condition_id, ts);
         CREATE INDEX IF NOT EXISTS idx_trades_wallet ON trades(wallet, ts);
+        CREATE INDEX IF NOT EXISTS idx_trades_accum ON trades(wallet, condition_id, outcome, side, price, ts);
 
         CREATE TABLE IF NOT EXISTS alerts (
             tx_key TEXT PRIMARY KEY,
