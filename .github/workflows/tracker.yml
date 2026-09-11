@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 concurrency:
   group: whale-tracker
@@ -28,17 +27,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Restore the latest persisted SQLite database.
-      - name: Download previous database
-        uses: dawidd6/action-download-artifact@v23
+      - name: Restore tracker state
+        uses: actions/cache@v4
         with:
-          workflow: tracker.yml
-          workflow_conclusion: success
-          name: tracker-db
-          path: .
-          search_artifacts: true
-          if_no_artifact_found: warn
-        continue-on-error: true
+          path: |
+            tracker.db
+            market_cache.json
+          key: tracker-db-${{ github.run_id }}
+          restore-keys: |
+            tracker-db-
 
       - name: Run poll
         env:
@@ -47,11 +44,3 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           python3 whale_tracker.py poll             --min-usd "${{ github.event.inputs.min_usd || '5000' }}"             --smart --min-pnl 5000 --min-winrate 0.55             --spike-usd 25000 --spike-window 30             --consensus-wallets 3 --consensus-window 60 --consensus-min-usd 1000
-
-      - name: Upload current database
-        uses: actions/upload-artifact@v4
-        with:
-          name: tracker-db
-          path: tracker.db
-          retention-days: 90
-          overwrite: true
