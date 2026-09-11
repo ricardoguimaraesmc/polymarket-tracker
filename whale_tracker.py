@@ -39,6 +39,277 @@ from polymarket_api import fetch_trades, fetch_positions, fetch_value, usd, trad
 from smartmoney import score_wallet, is_smart
 
 
+# ----------------------------- Shark Money filters -----------------------------
+MIN_ENTRY_ODD = 1.50
+MIN_ENTRY_PRICE = 1.0 / MIN_ENTRY_ODD
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+MARKET_CACHE_FILE = ".polymarket_market_cache.json"
+
+# Common Polymarket sports terms. Metadata from Gamma is the primary classifier;
+# these are only a fallback if metadata is temporarily unavailable.
+SPORTS_FALLBACK_TERMS = (
+    "football", "soccer", "basketball", "tennis", "baseball", "hockey",
+    "volleyball", "rugby", "cricket", "golf", "boxing", "mma", "ufc",
+    "formula 1", "formula1", "f1", "nascar", "motogp", "cycling",
+    "handball", "darts", "snooker", "table tennis", "ping pong",
+    "badminton", "wrestling", "esports", "e-sports", "counter-strike",
+    "counter strike", "valorant", "league of legends", "lol esports",
+    "dota", "dota 2", "rocket league", "overwatch", "call of duty",
+    "starcraft", "rainbow six", "league of legends", "mlbb",
+    "virtual football", "virtual soccer", "virtual basketball",
+    "virtual tennis", "virtual sports"
+)
+
+TRANSLATIONS = {
+    "moneyline": "vencedor da partida",
+    "match winner": "vencedor da partida",
+    "game winner": "vencedor do jogo",
+    "winner": "vencedor",
+    "to win": "para vencer",
+    "win": "vencer",
+    "draw": "empate",
+    "tie": "empate",
+    "over": "mais de",
+    "under": "menos de",
+    "both teams to score": "ambas marcam",
+    "yes": "sim",
+    "no": "não",
+    "spread": "handicap",
+    "asian handicap": "handicap asiático",
+    "handicap": "handicap",
+    "total goals": "total de gols",
+    "total points": "total de pontos",
+    "total games": "total de games",
+    "total sets": "total de sets",
+    "total maps": "total de mapas",
+    "match": "partida",
+    "game": "jogo",
+    "set": "set",
+    "map": "mapa",
+    "first half": "primeiro tempo",
+    "second half": "segundo tempo",
+    "quarter": "quarto",
+    "round": "round",
+    "final": "final",
+    "semi-final": "semifinal",
+    "semifinals": "semifinais",
+    "quarter-final": "quartas de final",
+    "quarterfinal": "quartas de final",
+    "playoffs": "playoffs",
+    "qualifier": "qualificatória",
+    "qualifiers": "qualificatórias",
+    "correct score": "placar exato",
+    "win or draw": "vitória ou empate",
+    "double chance": "dupla chance",
+    "first team to score": "primeiro time a marcar",
+    "last team to score": "último time a marcar",
+    "to qualify": "para se classificar",
+    "advance": "avançar",
+    "series winner": "vencedor da série",
+    "race winner": "vencedor da corrida",
+    "podium": "pódio",
+    "set winner": "vencedor do set",
+    "map winner": "vencedor do mapa",
+    "round winner": "vencedor do round",
+}
+
+def _load_market_cache():
+    try:
+        import json
+        with open(MARKET_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+_MARKET_CACHE = _load_market_cache()
+_MARKET_FAIL_CACHE = {}
+_CLOB_GST_CACHE = {}
+
+def _save_market_cache():
+    try:
+        import json, os
+        tmp = MARKET_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_MARKET_CACHE, f, ensure_ascii=False)
+        os.replace(tmp, MARKET_CACHE_FILE)
+    except Exception:
+        pass
+
+def _gamma_market(condition_id):
+    """Resolve official Gamma market metadata and cache it by condition ID."""
+    cid = (condition_id or "").strip()
+    if not cid:
+        return None
+    cached = _MARKET_CACHE.get(cid)
+    if cached is not None:
+        return cached or None
+
+    # A temporary API failure must not be persisted as an empty market forever.
+    failed_at = _MARKET_FAIL_CACHE.get(cid, 0)
+    if failed_at and time.time() - failed_at < 60:
+        return None
+
+    try:
+        from urllib.parse import urlencode
+        from urllib.request import Request, urlopen
+        url = GAMMA_BASE + "/markets?" + urlencode({
+            "condition_ids": cid,
+            "limit": 1,
+            "include_tag": "true",
+        })
+        req = Request(url, headers={"User-Agent": "SharkMoney/1.0"})
+        with urlopen(req, timeout=8) as resp:
+            import json
+            payload = json.loads(resp.read().decode("utf-8"))
+        market = payload[0] if isinstance(payload, list) and payload else None
+        _MARKET_CACHE[cid] = market or {}
+        _save_market_cache()
+        return market
+    except Exception:
+        # Do not persist failures. Retry after a short cooldown.
+        _MARKET_FAIL_CACHE[cid] = time.time()
+        return None
+
+def _is_sports_metadata(meta):
+    if not meta:
+        return False
+    category = str(meta.get("category") or "").strip().lower()
+    subcategory = str(meta.get("subcategory") or "").strip().lower()
+    market_type = str(meta.get("marketType") or "").strip().lower()
+    sports_market_type = str(meta.get("sportsMarketType") or "").strip().lower()
+
+    # Official sports-specific metadata is stronger than title keywords.
+    # Polymarket exposes gameId/team IDs/sportsMarketType on sports markets.
+    if sports_market_type or meta.get("gameId") or meta.get("teamAID") or meta.get("teamBID"):
+        return True
+
+    text = " ".join([category, subcategory, market_type])
+    if "sport" in text or "esport" in text:
+        return True
+    tags = meta.get("tags") or []
+    for tag in tags:
+        if isinstance(tag, dict):
+            s = " ".join(str(tag.get(k) or "") for k in ("slug", "label", "name")).lower()
+        else:
+            s = str(tag).lower()
+        if "sport" in s or "esport" in s:
+            return True
+    return False
+
+def is_sports_trade(t):
+    """Fail-closed sports classifier.
+
+    Official Gamma metadata is authoritative. If the metadata lookup fails,
+    the trade is NOT classified as sports; this prevents politics/crypto/etc.
+    from leaking through because a title happens to contain a sports word.
+    """
+    meta = _gamma_market(t.get("conditionId"))
+    if not meta:
+        return False
+    return _is_sports_metadata(meta)
+
+def implied_odd(t):
+    try:
+        price = float(t.get("price", 0))
+        if price <= 0:
+            return None
+        return 1.0 / price
+    except Exception:
+        return None
+
+def odd_allowed(t):
+    odd = implied_odd(t)
+    return odd is not None and odd >= MIN_ENTRY_ODD
+
+def _parse_iso_ts(value):
+    if not value:
+        return None
+    try:
+        s = str(value).replace("Z", "+00:00")
+        return int(datetime.fromisoformat(s).timestamp())
+    except Exception:
+        return None
+
+def event_phase(t):
+    """Classify the trade as PRÉ-LIVE or AO VIVO using official market timing."""
+    meta = _gamma_market(t.get("conditionId")) or {}
+    now_ts = int(time.time())
+
+    # Sports CLOB metadata exposes the actual game start time (gst).
+    # This is more precise than using the market creation/start date.
+    cid = t.get("conditionId")
+    if cid:
+        cid = str(cid)
+        start = _CLOB_GST_CACHE.get(cid)
+        if start is None:
+            try:
+                from urllib.request import Request, urlopen
+                import json
+                req = Request(
+                    "https://clob.polymarket.com/clob-markets/" + cid,
+                    headers={"User-Agent": "SharkMoney/1.0"},
+                )
+                with urlopen(req, timeout=6) as resp:
+                    clob = json.loads(resp.read().decode("utf-8"))
+                start = _parse_iso_ts(clob.get("gst"))
+                _CLOB_GST_CACHE[cid] = start
+            except Exception:
+                start = None
+            if start is not None:
+                return "🔴 AO VIVO" if now_ts >= start else "🟢 PRÉ-LIVE"
+        else:
+            return "🔴 AO VIVO" if now_ts >= start else "🟢 PRÉ-LIVE"
+
+    # Fallback to Gamma timing fields.
+    for key in ("gameStartTime", "game_start_time", "startDate", "start_date"):
+        start = _parse_iso_ts(meta.get(key))
+        if start is not None:
+            return "🔴 AO VIVO" if now_ts >= start else "🟢 PRÉ-LIVE"
+
+    # Never guess the phase when the official timing could not be confirmed.
+    return "⚪ STATUS INDETERMINADO"
+
+def _translate_text(text):
+    """Lightweight sports-betting translation; names/team names are preserved."""
+    if not text:
+        return ""
+    import re
+    out = str(text)
+    # Long phrases first so shorter replacements don't break them.
+    for src in sorted(TRANSLATIONS, key=len, reverse=True):
+        out = re.sub(r"(?i)(?<![\w])" + re.escape(src) + r"(?![\w])",
+                     TRANSLATIONS[src], out)
+    return out
+
+def translated_outcome(t):
+    return _translate_text(t.get("outcome") or "?")
+
+def translated_title(t):
+    return _translate_text(t.get("title") or "Mercado esportivo")
+
+def trade_context(t):
+    meta = _gamma_market(t.get("conditionId")) or {}
+    phase = event_phase(t)
+    return {
+        "meta": meta,
+        "phase": phase,
+        "category": str(meta.get("category") or "Sports"),
+        "title_pt": translated_title(t),
+        "outcome_pt": translated_outcome(t),
+        "odd": implied_odd(t),
+    }
+
+def _eligible_entry(t):
+    """Alert/accumulation eligibility: sports + BUY + odd >= 1.50."""
+    if (t.get("side") or "").upper() != "BUY":
+        return False
+    if not odd_allowed(t):
+        return False
+    return is_sports_trade(t)
+
+
+
 # ----------------------------- formatting -----------------------------
 def fmt_money(x):
     return f"${x:,.2f}"
@@ -62,22 +333,57 @@ def trade_line(t):
             f"{(t.get('outcome') or '?')[:8]:<8} @ {float(t.get('price',0)):.3f} | {(t.get('title') or '')[:50]}")
 
 
+def translate_market(t):
+    """Return the market/question in Portuguese without translating team/player names."""
+    meta = _gamma_market(t.get("conditionId")) or {}
+    raw = (
+        meta.get("question")
+        or meta.get("groupItemTitle")
+        or meta.get("marketType")
+        or "Mercado esportivo"
+    )
+    return _translate_text(raw)
+
+def _md_dynamic(text):
+    """Escape dynamic content for Telegram legacy Markdown."""
+    s = "" if text is None else str(text)
+    for ch in ("\\", "_", "*", "[", "]", "`"):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
 def alert_text(t, reasons, score=None):
-    arrow = "🟢 *BUY*" if t.get("side") == "BUY" else "🔴 *SELL*"
-    tags = " ".join({"whale": "🐋WHALE", "smart": "🧠SMART-MONEY",
-                     "watchlist": "⭐WATCHLIST", "spike": "📈SPIKE",
-                     "consensus": "🎯CONSENSUS"}.get(r, r) for r in reasons)
+    arrow = "🟢 *BUY*" if (t.get("side") or "").upper() == "BUY" else "🔴 *SELL*"
+    price = float(t.get("price", 0) or 0)
+    odd = (1.0 / price) if price > 0 else None
+    phase = event_phase(t)
+    market = _md_dynamic(translate_market(t))
+    outcome = _md_dynamic(_translate_text(t.get("outcome", "?")))
+    title = _md_dynamic(_translate_text(t.get("title", "")))
+    tags = " ".join({
+        "whale": "🐋WHALE", "smart": "🧠SMART-MONEY",
+        "watchlist": "⭐WATCHLIST", "spike": "📈SPIKE",
+        "consensus": "🎯CONSENSUS"
+    }.get(r, r) for r in reasons)
+
     lines = [
-        f"{tags}",
-        f"{arrow} {fmt_money(usd(t))}  @ {float(t.get('price',0)):.3f} ({float(t.get('price',0))*100:.0f}%)",
-        f"*{t.get('title','')}*",
-        f"Outcome: *{t.get('outcome','?')}*  |  Trader: `{name_of(t)}`",
+        tags or "🐋 *SHARK MONEY*",
+        f"{arrow} *{fmt_money(usd(t))}*",
+        f"🏟️ *Evento:* {title}",
+        f"🎯 *Mercado:* {market}",
+        f"📌 *Entrada:* {outcome}",
+        f"📊 *Odd:* {odd:.2f}" if odd is not None else "📊 *Odd:* —",
+        f"💵 *Preço Polymarket:* {price:.3f} ({price*100:.1f}%)",
+        f"⏱️ *Status:* {phase}",
+        f"👤 *Trader:* `{_md_dynamic(name_of(t))}`",
     ]
     if score:
-        lines.append(f"Trader stats: PnL {fmt_money(score['realized_pnl'])} | "
-                     f"winrate {score['winrate']*100:.0f}% ({score['n_closed']} closed)")
+        lines.append(
+            f"📈 *Trader:* PnL {fmt_money(score['realized_pnl'])} | "
+            f"winrate {score['winrate']*100:.0f}% ({score['n_closed']} fechadas)"
+        )
     wallet = t.get("proxyWallet", "")
-    lines.append(f"https://polymarket.com/profile/{wallet}")
+    if wallet:
+        lines.append(f"https://polymarket.com/profile/{wallet}")
     return "\n".join(lines)
 
 
@@ -108,7 +414,12 @@ def cmd_watch(args):
     try:
         while True:
             try:
-                trades = fetch_trades(limit=args.lookback)
+                now = int(time.time())
+                trades = fetch_trades(
+                    limit=args.lookback,
+                    start=now - max(120, args.interval * 4),
+                    end=now,
+                )
             except Exception as e:
                 print(f"⚠️ fetch error: {e}", file=sys.stderr)
                 time.sleep(args.interval)
@@ -118,6 +429,19 @@ def cmd_watch(args):
                 if k in seen:
                     continue
                 seen.add(k)
+
+                # Keep the interactive watcher consistent with poll:
+                # BUY alerts require sports + odd >= 1.50; SELL requires sports.
+                side = (t.get("side") or "").upper()
+                if side == "BUY":
+                    if not _eligible_entry(t):
+                        continue
+                elif side == "SELL":
+                    if not is_sports_trade(t):
+                        continue
+                else:
+                    continue
+
                 DB.insert_trade(conn, t, usd(t))
                 reasons, score = _evaluate(conn, t, args, follow, score_cache)
                 if reasons:
@@ -157,22 +481,38 @@ def accumulated_bet(conn, t):
 
     return float(row["total"] or 0), int(row["n"] or 0)
 def cmd_poll(args):
-    """Monitora BUY acumulado e reducao de posicao da mesma carteira."""
+    """Monitora BUY acumulado somente em esportes com odd >= 1,50."""
     conn = DB.connect(args.db)
 
     # Aproximadamente R$ 990 mil
     ACCUMULATED_MIN_USD = 190_000
 
-    # ---------------------------------------------------------
-    # Busca trades recentes
-    # ---------------------------------------------------------
-    trades = fetch_trades(limit=args.lookback)
+    # GitHub Actions roda a cada ~5 min. Usamos 10 min de sobreposição para
+    # não perder trades entre execuções. O fetch_trades robusto divide janelas
+    # lotadas automaticamente quando ultrapassam o limite de paginação.
+    now = int(time.time())
+    trades = fetch_trades(
+        limit=args.lookback,
+        start=now - 600,
+        end=now,
+    )
 
-    # Guarda somente trades que realmente entraram no banco agora.
-    # Isso evita tratar SELL antigo como uma nova retirada.
+    # Somente BUY esportivo com odd >= 1,50 entra no Shark Money.
+    # SELL é guardado apenas quando o mercado já é elegível, para detectar
+    # redução de posição depois do cruzamento dos US$ 190 mil.
     new_trades = []
 
     for t in trades:
+        side = (t.get("side") or "").upper()
+        if side == "BUY":
+            if not _eligible_entry(t):
+                continue
+        elif side == "SELL":
+            if not is_sports_trade(t):
+                continue
+        else:
+            continue
+
         tx_key = (
             f"{t.get('transactionHash', '')}:"
             f"{t.get('asset', '')}:"
@@ -189,14 +529,10 @@ def cmd_poll(args):
             new_trades.append(t)
 
     conn.commit()
-
     new_alerts = 0
 
     # =========================================================
-    # 1) HISTORICO COMPLETO
-    #
-    # Agrupa:
-    # mesma carteira + mesmo mercado + mesma selecao
+    # 1) HISTÓRICO E AGRUPAMENTO
     # =========================================================
     groups = conn.execute(
         """
@@ -204,147 +540,136 @@ def cmd_poll(args):
             wallet,
             condition_id,
             outcome,
-            COALESCE(
-                SUM(CASE WHEN side='BUY' THEN usd ELSE 0 END), 0
-            ) AS buy_total,
-            COALESCE(
-                SUM(CASE WHEN side='SELL' THEN usd ELSE 0 END), 0
-            ) AS sell_total,
-            COUNT(
-                CASE WHEN side='BUY' THEN 1 END
-            ) AS buy_count
+            COALESCE(SUM(CASE WHEN side='BUY' AND price <= ? THEN usd ELSE 0 END), 0) AS buy_total,
+            COALESCE(SUM(CASE WHEN side='SELL' THEN usd ELSE 0 END), 0) AS sell_total,
+            COUNT(CASE WHEN side='BUY' AND price <= ? THEN 1 END) AS buy_count
         FROM trades
-        WHERE wallet IS NOT NULL
-          AND wallet != ''
-          AND condition_id IS NOT NULL
-          AND condition_id != ''
-          AND outcome IS NOT NULL
-          AND outcome != ''
+        WHERE wallet IS NOT NULL AND wallet != ''
+          AND condition_id IS NOT NULL AND condition_id != ''
+          AND outcome IS NOT NULL AND outcome != ''
         GROUP BY wallet, condition_id, outcome
         HAVING buy_total >= ?
         """,
-        (ACCUMULATED_MIN_USD,),
+        (MIN_ENTRY_PRICE, MIN_ENTRY_PRICE, ACCUMULATED_MIN_USD),
     ).fetchall()
 
     # =========================================================
     # 2) ALERTA DE BUY ACUMULADO
     # =========================================================
     for g in groups:
-
         wallet = g["wallet"]
         condition_id = g["condition_id"]
         outcome = g["outcome"]
-
         buy_total = float(g["buy_total"] or 0)
         sell_total = float(g["sell_total"] or 0)
         buy_count = int(g["buy_count"] or 0)
 
-        alert_key = (
-            f"accumulated:{wallet}:"
-            f"{condition_id}:{outcome}"
-        )
-
-        # Ja avisou anteriormente.
-        if DB.already_alerted(conn, alert_key):
-            continue
-
-        # Descobre exatamente quando cruzou US$ 190 mil.
-        buy_rows = conn.execute(
-            """
-            SELECT ts, usd
-            FROM trades
-            WHERE wallet=?
-              AND condition_id=?
-              AND outcome=?
-              AND side='BUY'
-            ORDER BY ts ASC
-            """,
-            (wallet, condition_id, outcome),
-        ).fetchall()
-
-        running_buy = 0.0
-        threshold_ts = None
-
-        for b in buy_rows:
-            running_buy += float(b["usd"] or 0)
-
-            if running_buy >= ACCUMULATED_MIN_USD:
-                threshold_ts = int(b["ts"])
-                break
-
-        if threshold_ts is None:
-            continue
-
         latest = conn.execute(
             """
-            SELECT title
+            SELECT *
             FROM trades
-            WHERE wallet=?
-              AND condition_id=?
-              AND outcome=?
+            WHERE wallet=? AND condition_id=? AND outcome=?
             ORDER BY ts DESC
             LIMIT 1
             """,
             (wallet, condition_id, outcome),
         ).fetchone()
 
-        title = (
-            latest["title"]
-            if latest and latest["title"]
-            else "Mercado Polymarket"
-        )
+        if not latest:
+            continue
+
+        # Historical rows do not carry eventSlug in the current DB schema,
+        # so resolve the market directly by conditionId.
+        latest_t = {
+            "conditionId": condition_id,
+            "title": latest["title"],
+            "outcome": latest["outcome"],
+            "price": latest["price"],
+            "side": latest["side"],
+            "timestamp": latest["ts"],
+        }
+        if not is_sports_trade(latest_t):
+            continue
+
+        alert_key = f"accumulated:{wallet}:{condition_id}:{outcome}"
+        if DB.already_alerted(conn, alert_key):
+            continue
+
+        # Descobre exatamente o BUY que cruzou US$ 190 mil.
+        buy_rows = conn.execute(
+            """
+            SELECT ts, usd, price, title, outcome
+            FROM trades
+            WHERE wallet=? AND condition_id=? AND outcome=? AND side='BUY' AND price <= ?
+            ORDER BY ts ASC
+            """,
+            (wallet, condition_id, outcome, MIN_ENTRY_PRICE),
+        ).fetchall()
+
+        running_buy = 0.0
+        threshold_ts = None
+        threshold_price = None
+
+        for br in buy_rows:
+            running_buy += float(br["usd"] or 0)
+            if running_buy >= ACCUMULATED_MIN_USD:
+                threshold_ts = int(br["ts"])
+                threshold_price = float(br["price"] or 0)
+                break
+
+        if threshold_ts is None:
+            continue
+
+        threshold_trade = {
+            "conditionId": condition_id,
+            "title": latest["title"],
+            "outcome": outcome,
+            "price": threshold_price,
+            "side": "BUY",
+            "timestamp": threshold_ts,
+        }
+
+        if not odd_allowed(threshold_trade):
+            continue
+
+        ctx = trade_context(threshold_trade)
+        odd = ctx["odd"]
+        phase = ctx["phase"]
 
         txt = (
-            f"🐋 *APOSTA ACUMULADA DETECTADA*\n\n"
-            f"🎯 *Mercado:* {title}\n"
-            f"📌 *Seleção:* {outcome}\n"
+            f"🐋 *SHARK MONEY — ENTRADA ACUMULADA*\n\n"
+            f"🏆 *Evento:* {ctx['title_pt']}\n"
+            f"🎯 *Entrada:* {ctx['outcome_pt']}\n"
+            f"📊 *Odd:* {odd:.2f}\n"
+            f"💵 *Preço/Probabilidade:* {threshold_price:.3f} ({threshold_price*100:.1f}%)\n"
+            f"⏱️ *Momento:* {phase}\n"
             f"💰 *BUY acumulado:* ${buy_total:,.0f}\n"
             f"🧾 *Entradas BUY:* {buy_count}\n"
             f"🔴 *SELL acumulado:* ${sell_total:,.0f}\n"
-            f"📊 *Posição estimada:* "
-            f"${buy_total - sell_total:,.0f}\n"
+            f"📊 *Posição estimada:* ${buy_total - sell_total:,.0f}\n"
             f"👛 *Carteira:* `{wallet[:12]}...`\n\n"
-            f"🚨 *A carteira cruzou "
-            f"${ACCUMULATED_MIN_USD:,.0f} em BUY nessa seleção.*"
+            f"🚨 *A carteira cruzou ${ACCUMULATED_MIN_USD:,.0f} "
+            f"em entradas com odd mínima de {MIN_ENTRY_ODD:.2f}.*"
         )
 
         chans = notifier.notify(txt)
-
-        DB.mark_alerted(
-            conn,
-            alert_key,
-            "accumulated",
-        )
-
+        DB.mark_alerted(conn, alert_key, "accumulated")
         new_alerts += 1
 
         print(
-            f"ALERT [accumulated] "
-            f"{title[:50]} | {outcome} | "
-            f"BUY ${buy_total:,.0f} -> "
-            f"{chans or 'terminal'}"
+            f"ALERT [accumulated] {ctx['title_pt'][:50]} | "
+            f"{ctx['outcome_pt']} | odd {odd:.2f} | {phase} | "
+            f"BUY ${buy_total:,.0f} -> {chans or 'terminal'}"
         )
 
     # =========================================================
-    # 3) NOVOS SELL / REDUCAO DE POSICAO
-    #
-    # SOMENTE trades que entraram neste poll.
+    # 3) NOVOS SELL / REDUÇÃO DE POSIÇÃO
     # =========================================================
-    for t in sorted(
-        new_trades,
-        key=lambda x: x.get("timestamp", 0),
-    ):
-
-        side = (t.get("side") or "").upper()
-
-        if side != "SELL":
+    for t in sorted(new_trades, key=lambda x: x.get("timestamp", 0)):
+        if (t.get("side") or "").upper() != "SELL":
             continue
 
-        wallet = (
-            t.get("proxyWallet")
-            or ""
-        ).lower()
-
+        wallet = (t.get("proxyWallet") or "").lower()
         condition_id = t.get("conditionId") or ""
         outcome = t.get("outcome") or ""
         sell_ts = int(t.get("timestamp", 0))
@@ -352,140 +677,98 @@ def cmd_poll(args):
         if not wallet or not condition_id or not outcome:
             continue
 
-        # -----------------------------------------------------
-        # Descobre quando essa carteira atingiu US$ 190 mil.
-        # -----------------------------------------------------
+        # A posição só é considerada "Shark" se os BUYs elegíveis
+        # (esporte + odd >= 1,50) cruzaram o limite.
         buy_rows = conn.execute(
             """
-            SELECT ts, usd
+            SELECT ts, usd, price
             FROM trades
-            WHERE wallet=?
-              AND condition_id=?
-              AND outcome=?
-              AND side='BUY'
+            WHERE wallet=? AND condition_id=? AND outcome=? AND side='BUY' AND price <= ?
             ORDER BY ts ASC
             """,
-            (wallet, condition_id, outcome),
+            (wallet, condition_id, outcome, MIN_ENTRY_PRICE),
         ).fetchall()
 
         running_buy = 0.0
         threshold_ts = None
-
-        for b in buy_rows:
-            running_buy += float(b["usd"] or 0)
-
+        for br in buy_rows:
+            running_buy += float(br["usd"] or 0)
             if running_buy >= ACCUMULATED_MIN_USD:
-                threshold_ts = int(b["ts"])
+                threshold_ts = int(br["ts"])
                 break
 
-        # Nunca chegou a US$ 190 mil.
-        if threshold_ts is None:
-            continue
-
-        # SELL precisa acontecer DEPOIS do cruzamento.
-        if sell_ts <= threshold_ts:
+        if threshold_ts is None or sell_ts <= threshold_ts:
             continue
 
         sell_key = f"reverse:{trade_key(t)}"
-
         if DB.already_alerted(conn, sell_key):
             continue
 
-        # -----------------------------------------------------
-        # Calcula a posicao no momento exato do SELL.
-        # -----------------------------------------------------
         totals = conn.execute(
             """
             SELECT
-                COALESCE(
-                    SUM(
-                        CASE
-                            WHEN side='BUY' AND ts<=?
-                            THEN usd
-                            ELSE 0
-                        END
-                    ), 0
-                ) AS bought,
-
-                COALESCE(
-                    SUM(
-                        CASE
-                            WHEN side='SELL' AND ts<=?
-                            THEN usd
-                            ELSE 0
-                        END
-                    ), 0
-                ) AS sold
-
+                COALESCE(SUM(CASE WHEN side='BUY' AND ts<=? THEN usd ELSE 0 END),0) AS bought,
+                COALESCE(SUM(CASE WHEN side='SELL' AND ts<=? THEN usd ELSE 0 END),0) AS sold
             FROM trades
-            WHERE wallet=?
-              AND condition_id=?
-              AND outcome=?
+            WHERE wallet=? AND condition_id=? AND outcome=?
             """,
-            (
-                sell_ts,
-                sell_ts,
-                wallet,
-                condition_id,
-                outcome,
-            ),
+            (sell_ts, sell_ts, wallet, condition_id, outcome),
         ).fetchone()
 
         bought = float(totals["bought"] or 0)
         sold = float(totals["sold"] or 0)
         position = bought - sold
 
-        title = (
-            t.get("title")
-            or "Mercado Polymarket"
-        )
+        ctx = trade_context(t)
+        odd = ctx["odd"]
 
         txt = (
-            f"🔴 *REDUÇÃO DE POSIÇÃO DETECTADA*\n\n"
-            f"🎯 *Mercado:* {title}\n"
-            f"📌 *Seleção:* {outcome}\n"
-            f"👛 *Carteira:* `{wallet[:12]}...`\n\n"
-            f"💰 *BUY acumulado:* ${bought:,.0f}\n"
-            f"🔴 *SELL acumulado:* ${sold:,.0f}\n"
-            f"📊 *Posição estimada:* "
-            f"${position:,.0f}\n"
-            f"🔻 *Novo SELL:* ${usd(t):,.0f}\n\n"
-            f"⚠️ *Essa carteira havia cruzado "
-            f"${ACCUMULATED_MIN_USD:,.0f} em BUY "
-            f"e agora está reduzindo a posição.*"
+            f"🔴 *SHARK MONEY — REDUÇÃO DE POSIÇÃO*\n\n"
+            f"🏆 *Evento:* {ctx['title_pt']}\n"
+            f"🎯 *Entrada:* {ctx['outcome_pt']}\n"
+            f"📊 *Odd atual:* {odd:.2f}" if odd else
+            f"📊 *Odd atual:* indisponível"
+        )
+        txt += (
+            f"\n💵 *Preço/Probabilidade:* {float(t.get('price',0)):.3f} "
+            f"({float(t.get('price',0))*100:.1f}%)"
+            f"\n⏱️ *Momento:* {ctx['phase']}"
+            f"\n👛 *Carteira:* `{wallet[:12]}...`"
+            f"\n\n💰 *BUY acumulado:* ${bought:,.0f}"
+            f"\n🔴 *SELL acumulado:* ${sold:,.0f}"
+            f"\n📊 *Posição estimada:* ${position:,.0f}"
+            f"\n🔻 *Novo SELL:* ${usd(t):,.0f}"
+            f"\n\n⚠️ *Essa carteira havia cruzado "
+            f"${ACCUMULATED_MIN_USD:,.0f} em entradas elegíveis.*"
         )
 
         chans = notifier.notify(txt)
-
-        DB.mark_alerted(
-            conn,
-            sell_key,
-            "reverse",
-        )
-
+        DB.mark_alerted(conn, sell_key, "reverse")
         new_alerts += 1
 
         print(
-            f"ALERT [reverse] "
-            f"{title[:50]} | {outcome} | "
-            f"SELL ${usd(t):,.0f} | "
-            f"position ${position:,.0f} -> "
-            f"{chans or 'terminal'}"
+            f"ALERT [reverse] {ctx['title_pt'][:50]} | "
+            f"{ctx['outcome_pt']} | {ctx['phase']} | "
+            f"SELL ${usd(t):,.0f} -> {chans or 'terminal'}"
         )
 
     conn.commit()
     conn.close()
 
     print(
-        f"\n✅ poll done. "
-        f"{len(trades)} trades scanned, "
+        f"\n✅ poll done. {len(trades)} trades scanned, "
         f"{new_alerts} new alerts sent."
     )
 
 def cmd_consensus(args):
     """Find markets where several whales bought the same outcome recently."""
     conn = DB.connect(args.db)
-    trades = fetch_trades(limit=args.lookback)
+    now = int(time.time())
+    trades = fetch_trades(
+        limit=args.lookback,
+        start=now - args.window * 60,
+        end=now,
+    )
     for t in trades:
         DB.insert_trade(conn, t, usd(t))
     conn.commit()
@@ -538,6 +821,17 @@ def cmd_digest(args):
 def _evaluate(conn, t, args, follow, score_cache):
     """Return (reasons, score_or_None) for a trade given the active filters."""
     reasons = []
+
+    # Final safety gate for every alert path.
+    side = (t.get("side") or "").upper()
+    if side == "BUY":
+        if not _eligible_entry(t):
+            return [], None
+    elif side == "SELL":
+        if not is_sports_trade(t):
+            return [], None
+    else:
+        return [], None
     wallet = (t.get("proxyWallet") or "").lower()
     v = usd(t)
     if follow and wallet in follow:
