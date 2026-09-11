@@ -1,6 +1,5 @@
 name: Daily Whale Digest
 
-# Ringkasan harian jam 07:00 WIB (00:00 UTC) + bisa manual.
 on:
   schedule:
     - cron: "0 0 * * *"
@@ -8,6 +7,11 @@ on:
 
 permissions:
   contents: read
+  actions: read
+
+concurrency:
+  group: whale-tracker
+  cancel-in-progress: false
 
 jobs:
   digest:
@@ -19,14 +23,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Pakai DB yang sama dengan tracker biar datanya nyambung
-      - name: Restore DB cache
-        uses: actions/cache@v4
+      # Restore the same persisted SQLite database used by the tracker.
+      - name: Download previous database
+        uses: dawidd6/action-download-artifact@v23
         with:
-          path: tracker.db
-          key: tracker-db-digest-${{ github.run_id }}
-          restore-keys: |
-            tracker-db-
+          workflow: tracker.yml
+          workflow_conclusion: success
+          name: tracker-db
+          path: .
+          search_artifacts: true
+          if_no_artifact_found: warn
+        continue-on-error: true
 
       - name: Send digest
         env:
